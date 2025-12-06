@@ -5,10 +5,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub mod hashmap_counter;
 pub mod dashmap_counter;
 pub mod hyperloglog_counter;
+pub mod hashmap_fxhash;
+pub mod hashmap_ahash;
 
 pub use hashmap_counter::HashMapCounter;
 pub use dashmap_counter::DashMapCounter;
 pub use hyperloglog_counter::HyperLogLogCounter;
+pub use hashmap_fxhash::HashMapFxHashCounter;
+pub use hashmap_ahash::HashMapAHashCounter;
 
 #[cfg(target_os = "linux")]
 use procfs::process::Process;
