@@ -2,10 +2,12 @@ mod counters;
 
 use clap::Parser;
 use counters::{
-    DashMapCounter, HashMapCounter, HashMapFxHashCounter, HashMapAHashCounter,
-    HyperLogLogCounter, KmerCounter, MemoryTrackedCounter,
+    AHasher, DefaultHasher, GenericDashMapCounter, GenericHashMapCounter,
+    GenericHashMapHashCounter, HashCounter, HyperLogLogCounter, KmerCounter, 
+    MemoryTrackedCounter, MemoryTrackedHashCounter, NtHasher, XxHasher,
 };
 use rayon::prelude::*;
+use rustc_hash::FxBuildHasher;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::File;
@@ -57,6 +59,7 @@ enum HashType {
     Default,  // SipHash (secure but slow)
     FxHash,   // Fast non-cryptographic hash
     AHash,    // Very fast, high-quality hash
+    XxHash,   // Extremely fast hash (xxHash)
     NtHash,   // DNA k-mer specialized rolling hash
 }
 
@@ -68,6 +71,7 @@ impl std::str::FromStr for HashType {
             "default" | "siphash" => Ok(HashType::Default),
             "fxhash" | "fx" => Ok(HashType::FxHash),
             "ahash" => Ok(HashType::AHash),
+            "xxhash" | "xx" => Ok(HashType::XxHash),
             "nthash" | "nt" => Ok(HashType::NtHash),
             _ => Err(format!("Unknown hash type: {}", s)),
         }
@@ -86,11 +90,11 @@ struct Args {
     #[arg(short = 't', long, default_value_t = 1)]
     threads: usize,
 
-    /// Counter implementation to use (hashmap, dashmap, hyperloglog/hll)
+    /// Counter implementation to use [default: hashmap] [possible: hashmap, dashmap, hyperloglog/hll]
     #[arg(short = 'c', long, default_value = "hashmap")]
     counter: CounterType,
 
-    /// Hash function to use (default/siphash, fxhash/fx, ahash, nthash/nt)
+    /// Hash function to use [default: fxhash] [possible: fxhash/fx, ahash, xxhash/xx, default/siphash, nthash/nt]
     #[arg(short = 'H', long, default_value = "fxhash")]
     hash: HashType,
 
@@ -169,6 +173,40 @@ fn find_next_record_boundary(file: &mut File, pos: u64) -> std::io::Result<u64> 
     }
 }
 
+// New gzip processing with hash streaming
+fn process_chunk_gzip_hashes(
+    filename: &str,
+    k: usize,
+    show_progress: bool,
+) -> std::io::Result<HashMap<u64, u64>> {
+    use needletail::parse_fastx_file;
+    
+    let mut hash_counts = HashMap::new();
+    let mut reader = parse_fastx_file(filename)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    
+    let mut record_count = 0;
+    let mut total_bases = 0;
+    
+    while let Some(record) = reader.next() {
+        let seqrec = record.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let seq = seqrec.seq();
+        total_bases += seq.len() as u64;
+        count_hashes_in_sequence(&seq, k, &mut hash_counts);
+        
+        record_count += 1;
+        if show_progress && record_count % 1000 == 0 {
+            eprintln!("  Processed {} sequences, {} bases...", record_count, total_bases);
+        }
+    }
+    
+    if show_progress {
+        eprintln!("  Final: {} sequences, {} bases", record_count, total_bases);
+    }
+    
+    Ok(hash_counts)
+}
+
 fn process_chunk_gzip(
     filename: &str,
     k: usize,
@@ -203,6 +241,111 @@ fn process_chunk_gzip(
     }
     
     Ok(kmer_counts)
+}
+
+// New hash-based processing for NtHash optimization
+fn process_chunk_hashes(
+    filename: &str,
+    chunk: Chunk,
+    k: usize,
+) -> std::io::Result<HashMap<u64, u64>> {
+    let mut file = File::open(filename)?;
+    file.seek(SeekFrom::Start(chunk.start))?;
+    
+    let mut reader = BufReader::new(file);
+    let mut hash_counts = HashMap::new();
+    let mut current_pos = chunk.start;
+    let mut line = String::new();
+    let mut current_seq = Vec::new();
+    
+    while current_pos < chunk.end {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        
+        current_pos += bytes_read as u64;
+        
+        // Check if this is a header line
+        if line.starts_with('>') || line.starts_with('@') {
+            // Process previous sequence if any
+            if !current_seq.is_empty() {
+                count_hashes_in_sequence(&current_seq, k, &mut hash_counts);
+                current_seq.clear();
+            }
+        } else if line.starts_with('+') {
+            // FASTQ quality header - skip quality scores
+            line.clear();
+            let qual_bytes = reader.read_line(&mut line)?;
+            current_pos += qual_bytes as u64;
+        } else {
+            // Sequence line - accumulate it
+            let seq_line = line.trim().as_bytes();
+            current_seq.extend_from_slice(seq_line);
+        }
+    }
+    
+    // Process last sequence
+    if !current_seq.is_empty() {
+        count_hashes_in_sequence(&current_seq, k, &mut hash_counts);
+    }
+    
+    Ok(hash_counts)
+}
+
+// New function for hash-based counter processing
+fn run_with_hash_counter<C: HashCounter>(
+    args: &Args,
+    num_threads: usize,
+    chunks: Vec<Chunk>,
+    setup_time: std::time::Duration,
+    counter: C,
+) -> Result<(usize, u64, std::time::Duration, std::time::Duration, Option<u64>), Box<dyn std::error::Error>> {
+    let k = args.kmer_size;
+    let filename = &args.filename;
+    let json_mode = args.json;
+    
+    let count_start = std::time::Instant::now();
+    
+    // Check if file is gzipped
+    let is_gzip = filename.ends_with(".gz");
+    
+    if is_gzip {
+        // For gzipped files, use needletail (single-threaded)
+        match process_chunk_gzip_hashes(&filename, k, !json_mode) {
+            Ok(local_counts) => {
+                counter.merge_hashes(local_counts);
+            }
+            Err(e) => eprintln!("Error processing gzip file: {}", e),
+        }
+    } else {
+        // Process chunks in parallel for regular files
+        chunks.par_iter().enumerate().for_each(|(i, chunk)| {
+            if !json_mode {
+                let thread_idx = rayon::current_thread_index().unwrap_or(0);
+                println!("  Thread {} processing chunk {}...", thread_idx, i);
+            }
+            match process_chunk_hashes(&filename, Chunk { start: chunk.start, end: chunk.end }, k) {
+                Ok(local_counts) => {
+                    counter.merge_hashes(local_counts);
+                }
+                Err(e) => eprintln!("Error processing chunk {}: {}", i, e),
+            }
+        });
+    }
+    
+    let count_time = count_start.elapsed();
+    let total_time = setup_time + count_time;
+    
+    // Update peak memory after processing
+    counter.update_peak_memory();
+    
+    let unique_kmers = counter.unique_count();
+    let total_kmers = counter.total_count();
+    let peak_memory = counter.peak_memory_bytes();
+    
+    Ok((unique_kmers, total_kmers, count_time, total_time, peak_memory))
 }
 
 fn process_chunk(
@@ -264,6 +407,47 @@ fn count_kmers_in_sequence(seq: &[u8], k: usize, kmer_counts: &mut HashMap<Vec<u
     for i in 0..=seq.len() - k {
         let kmer = &seq[i..i + k];
         *kmer_counts.entry(kmer.to_vec()).or_insert(0) += 1;
+    }
+}
+
+// New streaming hash approach - counts hashes directly without k-mer extraction
+fn count_hashes_in_sequence(seq: &[u8], k: usize, hash_counts: &mut HashMap<u64, u64>) {
+    if seq.len() < k {
+        return;
+    }
+
+    // Check if sequence is valid DNA (only A,C,G,T,N after uppercase conversion)
+    let is_valid_dna = seq.iter().all(|&b| {
+        let upper_b = b.to_ascii_uppercase();
+        matches!(upper_b, b'A' | b'C' | b'G' | b'T' | b'N')
+    });
+
+    if is_valid_dna {
+        // Normalize sequence to uppercase
+        let normalized: Vec<u8> = seq
+            .iter()
+            .map(|&b| b.to_ascii_uppercase())
+            .collect();
+        
+        // Try NtHash rolling hash for valid DNA sequences
+        if let Ok(nthash_iter) = nthash::NtHashIterator::new(&normalized, k) {
+            // Use rolling hash - much faster for DNA
+            for hash_value in nthash_iter {
+                *hash_counts.entry(hash_value).or_insert(0) += 1;
+            }
+            return;
+        }
+    }
+    
+    // Fallback to sliding window with FNV hash for non-DNA or NtHash failures
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    
+    for i in 0..=seq.len() - k {
+        let mut hasher = DefaultHasher::new();
+        seq[i..i + k].hash(&mut hasher);
+        let hash_value = hasher.finish();
+        *hash_counts.entry(hash_value).or_insert(0) += 1;
     }
 }
 
@@ -423,24 +607,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Select counter implementation and run
     let (unique_kmers, total_kmers, count_time, total_time, peak_memory) = match (args.counter, args.hash) {
         (CounterType::HashMap, HashType::Default) => {
-            let counter = MemoryTrackedCounter::<HashMapCounter>::new();
+            let counter = MemoryTrackedCounter::<GenericHashMapCounter<DefaultHasher>>::new();
             run_with_counter(&args, num_threads, chunks, setup_time, counter)?
         },
         (CounterType::HashMap, HashType::FxHash) => {
-            let counter = MemoryTrackedCounter::<HashMapFxHashCounter>::new();
+            let counter = MemoryTrackedCounter::<GenericHashMapCounter<FxBuildHasher>>::new();
             run_with_counter(&args, num_threads, chunks, setup_time, counter)?
         },
         (CounterType::HashMap, HashType::AHash) => {
-            let counter = MemoryTrackedCounter::<HashMapAHashCounter>::new();
+            let counter = MemoryTrackedCounter::<GenericHashMapCounter<AHasher>>::new();
+            run_with_counter(&args, num_threads, chunks, setup_time, counter)?
+        },
+        (CounterType::HashMap, HashType::XxHash) => {
+            let counter = MemoryTrackedCounter::<GenericHashMapCounter<XxHasher>>::new();
             run_with_counter(&args, num_threads, chunks, setup_time, counter)?
         },
         (CounterType::HashMap, HashType::NtHash) => {
-            eprintln!("NtHash not yet implemented");
-            std::process::exit(1);
+            let counter = MemoryTrackedHashCounter::<GenericHashMapHashCounter<DefaultHasher>>::new();
+            run_with_hash_counter(&args, num_threads, chunks, setup_time, counter)?
         },
-        (CounterType::DashMap, _) => {
-            let counter = MemoryTrackedCounter::<DashMapCounter>::new();
+        (CounterType::DashMap, HashType::Default) => {
+            let counter = MemoryTrackedCounter::<GenericDashMapCounter<DefaultHasher>>::new();
             run_with_counter(&args, num_threads, chunks, setup_time, counter)?
+        },
+        (CounterType::DashMap, HashType::FxHash) => {
+            let counter = MemoryTrackedCounter::<GenericDashMapCounter<FxBuildHasher>>::new();
+            run_with_counter(&args, num_threads, chunks, setup_time, counter)?
+        },
+        (CounterType::DashMap, HashType::AHash) => {
+            let counter = MemoryTrackedCounter::<GenericDashMapCounter<AHasher>>::new();
+            run_with_counter(&args, num_threads, chunks, setup_time, counter)?
+        },
+        (CounterType::DashMap, HashType::XxHash) => {
+            let counter = MemoryTrackedCounter::<GenericDashMapCounter<XxHasher>>::new();
+            run_with_counter(&args, num_threads, chunks, setup_time, counter)?
+        },
+        (CounterType::DashMap, HashType::NtHash) => {
+            let counter = MemoryTrackedHashCounter::<GenericHashMapHashCounter<DefaultHasher>>::new();
+            run_with_hash_counter(&args, num_threads, chunks, setup_time, counter)?
         },
         (CounterType::HyperLogLog, _) => {
             let counter = MemoryTrackedCounter::<HyperLogLogCounter>::new();
