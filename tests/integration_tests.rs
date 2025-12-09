@@ -28,7 +28,7 @@ fn test_kmer_count_non_zero() {
 
 #[test]
 fn test_different_hash_functions() {
-    let hash_types = vec!["default", "fxhash", "ahash"];
+    let hash_types = vec!["fxhash", "nthash"];
     
     for hash in &hash_types {
         let output = Command::new("cargo")

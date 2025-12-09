@@ -2,12 +2,11 @@ mod counters;
 
 use clap::Parser;
 use counters::{
-    AHasher, DefaultHasher, GenericDashMapCounter, GenericHashMapCounter,
+    DefaultHasher, FxBuildHasher, GenericDashMapCounter, GenericHashMapCounter,
     GenericHashMapHashCounter, HashCounter, HyperLogLogCounter, KmerCounter, 
-    MemoryTrackedCounter, MemoryTrackedHashCounter, NtHasher, XxHasher,
+    MemoryTrackedCounter, MemoryTrackedHashCounter,
 };
 use rayon::prelude::*;
-use rustc_hash::FxBuildHasher;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::File;
@@ -56,10 +55,7 @@ impl std::str::FromStr for CounterType {
 
 #[derive(Debug, Clone, Copy)]
 enum HashType {
-    Default,  // SipHash (secure but slow)
     FxHash,   // Fast non-cryptographic hash
-    AHash,    // Very fast, high-quality hash
-    XxHash,   // Extremely fast hash (xxHash)
     NtHash,   // DNA k-mer specialized rolling hash
 }
 
@@ -68,12 +64,9 @@ impl std::str::FromStr for HashType {
     
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "default" | "siphash" => Ok(HashType::Default),
             "fxhash" | "fx" => Ok(HashType::FxHash),
-            "ahash" => Ok(HashType::AHash),
-            "xxhash" | "xx" => Ok(HashType::XxHash),
             "nthash" | "nt" => Ok(HashType::NtHash),
-            _ => Err(format!("Unknown hash type: {}", s)),
+            _ => Err(format!("Unknown hash type: {} (available: fxhash/fx, nthash/nt)", s)),
         }
     }
 }
@@ -94,7 +87,7 @@ struct Args {
     #[arg(short = 'c', long, default_value = "hashmap")]
     counter: CounterType,
 
-    /// Hash function to use [default: fxhash] [possible: fxhash/fx, ahash, xxhash/xx, default/siphash, nthash/nt]
+    /// Hash function to use [default: fxhash] [possible: fxhash/fx, nthash/nt]
     #[arg(short = 'H', long, default_value = "fxhash")]
     hash: HashType,
 
@@ -103,6 +96,10 @@ struct Args {
     /// Standard error ≈ 1.04/sqrt(2^p). Default p=14 gives ~0.81% error with 16KB memory
     #[arg(long, default_value_t = 14)]
     hll_precision: usize,
+
+    /// Pin threads to CPU cores for better cache locality and NUMA performance
+    #[arg(long)]
+    pin_threads: bool,
 
     /// Output results as JSON
     #[arg(long)]
@@ -306,7 +303,7 @@ fn process_chunk_hashes(
 // New function for hash-based counter processing
 fn run_with_hash_counter<C: HashCounter>(
     args: &Args,
-    num_threads: usize,
+    _num_threads: usize,
     chunks: Vec<Chunk>,
     setup_time: std::time::Duration,
     counter: C,
@@ -462,6 +459,38 @@ fn process_kmers_streaming_nthash(seq: &[u8], k: usize, counter: &HyperLogLogCou
     // This is appropriate for DNA k-mer counting applications
 }
 
+// Generic k-mer processing for HyperLogLog using sliding window hashing
+fn process_kmers_streaming_generic(seq: &[u8], k: usize, counter: &HyperLogLogCounter) {
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    
+    if seq.len() < k {
+        return;
+    }
+
+    const BATCH_SIZE: usize = 10000;
+    let mut hash_buffer = Vec::with_capacity(BATCH_SIZE);
+
+    // Slide through the sequence and hash each k-mer
+    for i in 0..=seq.len() - k {
+        let kmer = &seq[i..i + k];
+        let mut hasher = DefaultHasher::new();
+        kmer.hash(&mut hasher);
+        let hash_value = hasher.finish();
+        
+        hash_buffer.push(hash_value);
+        
+        if hash_buffer.len() >= BATCH_SIZE {
+            counter.batch_add_hashes(&hash_buffer);
+            hash_buffer.clear();
+        }
+    }
+    
+    if !hash_buffer.is_empty() {
+        counter.batch_add_hashes(&hash_buffer);
+    }
+}
+
 // HLL-specific file chunk processing with streaming (no intermediate HashMap)
 // Processes one file chunk (for parallelization) by reading sequences and updating
 // the shared HLL counter directly. Uses sequence windows to limit memory.
@@ -470,6 +499,7 @@ fn process_file_chunk_hll_streaming(
     chunk: Chunk,
     k: usize,
     counter: &HyperLogLogCounter,
+    use_nthash: bool,
 ) -> std::io::Result<()> {
     const MAX_SEQ_WINDOW: usize = 10_000_000; // Process long sequences in 10MB windows to limit memory
     
@@ -494,7 +524,11 @@ fn process_file_chunk_hll_streaming(
         if line.starts_with('>') || line.starts_with('@') {
             // Process previous sequence if any
             if !current_seq.is_empty() {
-                process_kmers_streaming_nthash(&current_seq, k, counter);
+                if use_nthash {
+                    process_kmers_streaming_nthash(&current_seq, k, counter);
+                } else {
+                    process_kmers_streaming_generic(&current_seq, k, counter);
+                }
                 current_seq.clear();
             }
         } else if line.starts_with('+') {
@@ -511,7 +545,11 @@ fn process_file_chunk_hll_streaming(
             // This limits memory usage while maintaining k-mer continuity across windows
             if current_seq.len() >= MAX_SEQ_WINDOW {
                 // Process what we have so far
-                process_kmers_streaming_nthash(&current_seq, k, counter);
+                if use_nthash {
+                    process_kmers_streaming_nthash(&current_seq, k, counter);
+                } else {
+                    process_kmers_streaming_generic(&current_seq, k, counter);
+                }
                 
                 // Keep last k-1 bases for continuity (to handle k-mers spanning the window boundary)
                 if current_seq.len() >= k {
@@ -525,7 +563,11 @@ fn process_file_chunk_hll_streaming(
     
     // Process last sequence
     if !current_seq.is_empty() {
-        process_kmers_streaming_nthash(&current_seq, k, counter);
+        if use_nthash {
+            process_kmers_streaming_nthash(&current_seq, k, counter);
+        } else {
+            process_kmers_streaming_generic(&current_seq, k, counter);
+        }
     }
     
     Ok(())
@@ -537,6 +579,7 @@ fn process_chunk_gzip_hll_streaming(
     k: usize,
     counter: &HyperLogLogCounter,
     show_progress: bool,
+    use_nthash: bool,
 ) -> std::io::Result<()> {
     use needletail::parse_fastx_file;
     
@@ -554,7 +597,11 @@ fn process_chunk_gzip_hll_streaming(
         let seqrec = record.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let seq = seqrec.seq();
         total_bases += seq.len() as u64;
-        process_kmers_streaming_nthash(&seq, k, counter);
+        if use_nthash {
+            process_kmers_streaming_nthash(&seq, k, counter);
+        } else {
+            process_kmers_streaming_generic(&seq, k, counter);
+        }
         
         record_count += 1;
         if show_progress && record_count % 1000 == 0 {
@@ -616,40 +663,61 @@ fn run_with_hll_streaming(
     chunks: Vec<Chunk>,
     setup_time: std::time::Duration,
     counter: HyperLogLogCounter,
+    use_nthash: bool,
 ) -> Result<(usize, u64, std::time::Duration, std::time::Duration, Option<u64>), Box<dyn std::error::Error>> {
     
     let k = args.kmer_size;
     let filename = args.filename.clone();
     let json_mode = args.json;
     let is_gzip = args.filename.ends_with(".gz");
+    let precision = counter.get_precision();
     
-    // Wrap in Arc for thread-safe sharing
-    let counter = std::sync::Arc::new(counter);
+    // Wrap in Arc for peak memory tracking
+    let peak_memory = counter.peak_memory.clone();
     
     // Initial memory reading
     if let Some(mem) = counters::get_memory_usage_bytes() {
-        counter.peak_memory.store(mem, std::sync::atomic::Ordering::Relaxed);
+        peak_memory.store(mem, std::sync::atomic::Ordering::Relaxed);
     }
     
     let count_start = std::time::Instant::now();
     
     if is_gzip {
-        // For gzipped files, use needletail (single-threaded)
-        if let Err(e) = process_chunk_gzip_hll_streaming(&filename, k, &*counter, !json_mode) {
+        // For gzipped files, use needletail (single-threaded) - process directly into main counter
+        if let Err(e) = process_chunk_gzip_hll_streaming(&filename, k, &counter, !json_mode, use_nthash) {
             eprintln!("Error processing gzip file: {}", e);
         }
     } else {
-        // Process chunks in parallel for regular files
+        // Thread-local approach: each thread gets its own HLL, merge at end
         use rayon::prelude::*;
-        chunks.par_iter().enumerate().for_each(|(i, chunk)| {
+        
+        let local_hlls: Vec<HyperLogLogCounter> = chunks.par_iter().enumerate().map(|(i, chunk)| {
             if !json_mode {
                 let thread_idx = rayon::current_thread_index().unwrap_or(0);
                 println!("  Thread {} processing chunk {}...", thread_idx, i);
             }
-            if let Err(e) = process_file_chunk_hll_streaming(&filename, Chunk { start: chunk.start, end: chunk.end }, k, &*counter) {
+            
+            // Create thread-local HLL with same precision
+            let local_hll = HyperLogLogCounter::with_precision(precision);
+            
+            // Process chunk into thread-local HLL
+            if let Err(e) = process_file_chunk_hll_streaming(
+                &filename, 
+                Chunk { start: chunk.start, end: chunk.end }, 
+                k, 
+                &local_hll,
+                use_nthash
+            ) {
                 eprintln!("Error processing chunk {}: {}", i, e);
             }
-        });
+            
+            local_hll
+        }).collect();
+        
+        // Merge all thread-local HLLs into the main counter
+        for local_hll in local_hlls {
+            counter.merge_hll(&local_hll);
+        }
     }
     
     let count_time = count_start.elapsed();
@@ -657,9 +725,9 @@ fn run_with_hll_streaming(
     
     // Final memory reading
     if let Some(mem) = counters::get_memory_usage_bytes() {
-        let mut peak = counter.peak_memory.load(std::sync::atomic::Ordering::Relaxed);
+        let mut peak = peak_memory.load(std::sync::atomic::Ordering::Relaxed);
         while mem > peak {
-            match counter.peak_memory.compare_exchange_weak(
+            match peak_memory.compare_exchange_weak(
                 peak,
                 mem,
                 std::sync::atomic::Ordering::Relaxed,
@@ -681,12 +749,12 @@ fn run_with_hll_streaming(
                   counter_heap_size, counter_heap_size as f64 / 1024.0);
     }
     
-    let peak_memory = {
-        let peak = counter.peak_memory.load(std::sync::atomic::Ordering::Relaxed);
+    let peak_memory_val = {
+        let peak = peak_memory.load(std::sync::atomic::Ordering::Relaxed);
         if peak > 0 { Some(peak) } else { None }
     };
     
-    Ok((unique_kmers, total_kmers, count_time, total_time, peak_memory))
+    Ok((unique_kmers, total_kmers, count_time, total_time, peak_memory_val))
 }
 
 fn run_with_counter<C: KmerCounter + 'static>(
@@ -751,11 +819,38 @@ fn run_with_counter<C: KmerCounter + 'static>(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    // Set number of threads
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(args.threads)
-        .build_global()
-        .unwrap();
+    // Set number of threads with optional core pinning
+    if args.pin_threads {
+        // Get available CPU cores
+        let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+        
+        if !args.json {
+            println!("Core pinning enabled. Available cores: {}", core_ids.len());
+        }
+        
+        // Build thread pool with core pinning
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .start_handler(move |thread_index| {
+                if thread_index < core_ids.len() {
+                    let core_id = core_ids[thread_index];
+                    if !core_affinity::set_for_current(core_id) {
+                        eprintln!("Warning: Failed to pin thread {} to core {:?}", thread_index, core_id);
+                    }
+                } else {
+                    eprintln!("Warning: Thread {} has no core to pin to (available: {})", 
+                              thread_index, core_ids.len());
+                }
+            })
+            .build_global()
+            .unwrap();
+    } else {
+        // Build thread pool without core pinning
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .build_global()
+            .unwrap();
+    }
 
     let num_threads = rayon::current_num_threads();
 
@@ -848,41 +943,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Select counter implementation and run
     let (unique_kmers, total_kmers, count_time, total_time, peak_memory, counter_heap_bytes) = match (args.counter, args.hash) {
-        (CounterType::HashMap, HashType::Default) => {
-            let counter = MemoryTrackedCounter::<GenericHashMapCounter<DefaultHasher>>::new();
-            let counter_clone = counter.clone();
-            let (unique, total, ctime, ttime, pmem) = run_with_counter(&args, num_threads, chunks.clone(), setup_time, counter)?;
-            let heap_size = counter_clone.inner().heap_size_bytes();
-            if !args.json {
-                eprintln!("HashMap counter heap size: {} bytes ({:.2} MB)", 
-                          heap_size, heap_size as f64 / 1_048_576.0);
-            }
-            (unique, total, ctime, ttime, pmem, Some(heap_size))
-        },
         (CounterType::HashMap, HashType::FxHash) => {
             let counter = MemoryTrackedCounter::<GenericHashMapCounter<FxBuildHasher>>::new();
-            let counter_clone = counter.clone();
-            let (unique, total, ctime, ttime, pmem) = run_with_counter(&args, num_threads, chunks.clone(), setup_time, counter)?;
-            let heap_size = counter_clone.inner().heap_size_bytes();
-            if !args.json {
-                eprintln!("HashMap counter heap size: {} bytes ({:.2} MB)", 
-                          heap_size, heap_size as f64 / 1_048_576.0);
-            }
-            (unique, total, ctime, ttime, pmem, Some(heap_size))
-        },
-        (CounterType::HashMap, HashType::AHash) => {
-            let counter = MemoryTrackedCounter::<GenericHashMapCounter<AHasher>>::new();
-            let counter_clone = counter.clone();
-            let (unique, total, ctime, ttime, pmem) = run_with_counter(&args, num_threads, chunks.clone(), setup_time, counter)?;
-            let heap_size = counter_clone.inner().heap_size_bytes();
-            if !args.json {
-                eprintln!("HashMap counter heap size: {} bytes ({:.2} MB)", 
-                          heap_size, heap_size as f64 / 1_048_576.0);
-            }
-            (unique, total, ctime, ttime, pmem, Some(heap_size))
-        },
-        (CounterType::HashMap, HashType::XxHash) => {
-            let counter = MemoryTrackedCounter::<GenericHashMapCounter<XxHasher>>::new();
             let counter_clone = counter.clone();
             let (unique, total, ctime, ttime, pmem) = run_with_counter(&args, num_threads, chunks.clone(), setup_time, counter)?;
             let heap_size = counter_clone.inner().heap_size_bytes();
@@ -903,41 +965,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             (unique, total, ctime, ttime, pmem, Some(heap_size))
         },
-        (CounterType::DashMap, HashType::Default) => {
-            let counter = MemoryTrackedCounter::<GenericDashMapCounter<DefaultHasher>>::new();
-            let counter_clone = counter.clone();
-            let (unique, total, ctime, ttime, pmem) = run_with_counter(&args, num_threads, chunks.clone(), setup_time, counter)?;
-            let heap_size = counter_clone.inner().heap_size_bytes();
-            if !args.json {
-                eprintln!("DashMap counter heap size: {} bytes ({:.2} MB)", 
-                          heap_size, heap_size as f64 / 1_048_576.0);
-            }
-            (unique, total, ctime, ttime, pmem, Some(heap_size))
-        },
         (CounterType::DashMap, HashType::FxHash) => {
             let counter = MemoryTrackedCounter::<GenericDashMapCounter<FxBuildHasher>>::new();
-            let counter_clone = counter.clone();
-            let (unique, total, ctime, ttime, pmem) = run_with_counter(&args, num_threads, chunks.clone(), setup_time, counter)?;
-            let heap_size = counter_clone.inner().heap_size_bytes();
-            if !args.json {
-                eprintln!("DashMap counter heap size: {} bytes ({:.2} MB)", 
-                          heap_size, heap_size as f64 / 1_048_576.0);
-            }
-            (unique, total, ctime, ttime, pmem, Some(heap_size))
-        },
-        (CounterType::DashMap, HashType::AHash) => {
-            let counter = MemoryTrackedCounter::<GenericDashMapCounter<AHasher>>::new();
-            let counter_clone = counter.clone();
-            let (unique, total, ctime, ttime, pmem) = run_with_counter(&args, num_threads, chunks.clone(), setup_time, counter)?;
-            let heap_size = counter_clone.inner().heap_size_bytes();
-            if !args.json {
-                eprintln!("DashMap counter heap size: {} bytes ({:.2} MB)", 
-                          heap_size, heap_size as f64 / 1_048_576.0);
-            }
-            (unique, total, ctime, ttime, pmem, Some(heap_size))
-        },
-        (CounterType::DashMap, HashType::XxHash) => {
-            let counter = MemoryTrackedCounter::<GenericDashMapCounter<XxHasher>>::new();
             let counter_clone = counter.clone();
             let (unique, total, ctime, ttime, pmem) = run_with_counter(&args, num_threads, chunks.clone(), setup_time, counter)?;
             let heap_size = counter_clone.inner().heap_size_bytes();
@@ -958,7 +987,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             (unique, total, ctime, ttime, pmem, Some(heap_size))
         },
-        (CounterType::HyperLogLog, _) => {
+        (CounterType::HyperLogLog, hash_type) => {
             // Validate precision parameter
             if args.hll_precision < 4 || args.hll_precision > 16 {
                 eprintln!("Error: HyperLogLog precision must be between 4 and 16");
@@ -968,16 +997,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let counter = HyperLogLogCounter::with_precision(args.hll_precision);
             let heap_size = counter.heap_size_bytes();
             
+            // Determine if we should use NtHash
+            let use_nthash = matches!(hash_type, HashType::NtHash);
+            
             if !args.json {
                 let std_error = 1.04 / (1_u64 << (args.hll_precision / 2)) as f64;
+                let hash_name = match hash_type {
+                    HashType::NtHash => "NtHash (rolling hash)",
+                    HashType::FxHash => "FxHash",
+                };
                 eprintln!("HyperLogLog configuration:");
                 eprintln!("  Precision (p): {}", args.hll_precision);
                 eprintln!("  Registers (m): {}", 1 << args.hll_precision);
                 eprintln!("  Memory: {} bytes ({:.2} KB)", heap_size, heap_size as f64 / 1024.0);
                 eprintln!("  Expected std error: ~{:.2}%", std_error * 100.0);
+                eprintln!("  Hash function: {}", hash_name);
             }
             
-            let (unique, total, ctime, ttime, pmem) = run_with_hll_streaming(&args, num_threads, chunks, setup_time, counter)?;
+            let (unique, total, ctime, ttime, pmem) = run_with_hll_streaming(&args, num_threads, chunks, setup_time, counter, use_nthash)?;
             (unique, total, ctime, ttime, pmem, Some(heap_size))
         },
     };

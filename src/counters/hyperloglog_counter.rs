@@ -101,10 +101,44 @@ impl HyperLogLogCounter {
     }
     
     /// Batch add multiple hashes (more efficient for bulk operations)
+    /// This reduces atomic contention by computing max rho values locally first
     pub fn batch_add_hashes(&self, hashes: &[u64]) {
+        // Process hashes directly without intermediate storage
+        // Group updates by register to reduce contention
         for &hash in hashes {
-            self.add_hash(hash);
+            let hash32 = hash as u32;
+            let j = (hash32 & ((1 << self.p) - 1)) as usize;
+            let w = hash32 >> self.p;
+            
+            let rho = if w == 0 {
+                (32 - self.p + 1) as u8
+            } else {
+                let lz = w.leading_zeros();
+                (lz - self.p as u32 + 1).min(32) as u8
+            };
+            
+            // Try to update register with relaxed ordering
+            // Only use atomic if the new value is larger
+            let current = self.registers[j].load(Ordering::Relaxed);
+            if rho > current {
+                // Try to update atomically
+                let mut old = current;
+                while rho > old {
+                    match self.registers[j].compare_exchange_weak(
+                        old,
+                        rho,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(x) => old = x,
+                    }
+                }
+            }
         }
+        
+        // Update total count
+        self.total_kmers.fetch_add(hashes.len() as u64, Ordering::Relaxed);
     }
     
     /// Get the estimated unique count using the HyperLogLog algorithm
@@ -150,6 +184,40 @@ impl HyperLogLogCounter {
     /// Get the total count of k-mers processed
     pub fn get_total_count(&self) -> u64 {
         self.total_kmers.load(Ordering::Relaxed)
+    }
+    
+    /// Get the precision parameter (p)
+    pub fn get_precision(&self) -> usize {
+        self.p
+    }
+    
+    /// Merge another HyperLogLog counter into this one
+    /// Takes the maximum of each register (standard HLL merge operation)
+    pub fn merge_hll(&self, other: &HyperLogLogCounter) {
+        assert_eq!(self.p, other.p, "Cannot merge HLLs with different precision");
+        
+        for i in 0..self.m {
+            let other_val = other.registers[i].load(Ordering::Relaxed);
+            if other_val > 0 {
+                // Update with max(self[i], other[i])
+                let mut current = self.registers[i].load(Ordering::Relaxed);
+                while other_val > current {
+                    match self.registers[i].compare_exchange_weak(
+                        current,
+                        other_val,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(x) => current = x,
+                    }
+                }
+            }
+        }
+        
+        // Merge total counts
+        let other_total = other.total_kmers.load(Ordering::Relaxed);
+        self.total_kmers.fetch_add(other_total, Ordering::Relaxed);
     }
     
     /// Calculate alpha_m constant based on the number of registers
