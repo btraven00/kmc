@@ -105,7 +105,7 @@ pub use NtHashBuilder as NtHasher;
 #[cfg(target_os = "linux")]
 use procfs::process::Process;
 
-fn get_memory_usage_bytes() -> Option<u64> {
+pub fn get_memory_usage_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         Process::myself()
@@ -136,6 +136,7 @@ pub trait HashCounterCore: Send + Sync {
 }
 
 // Wrapper that adds memory tracking to any counter implementation
+#[derive(Clone)]
 pub struct MemoryTrackedCounter<C: KmerCounterCore> {
     inner: C,
     peak_memory: Arc<AtomicU64>,
@@ -167,9 +168,15 @@ impl<C: KmerCounterCore> MemoryTrackedCounter<C> {
             }
         }
     }
+    
+    /// Get reference to the inner counter for accessing type-specific methods
+    pub fn inner(&self) -> &C {
+        &self.inner
+    }
 }
 
 // Hash-based memory tracked counter
+#[derive(Clone)]
 pub struct MemoryTrackedHashCounter<C: HashCounterCore> {
     inner: C,
     peak_memory: Arc<AtomicU64>,
@@ -200,6 +207,11 @@ impl<C: HashCounterCore> MemoryTrackedHashCounter<C> {
                 }
             }
         }
+    }
+    
+    /// Get reference to the inner counter for accessing type-specific methods
+    pub fn inner(&self) -> &C {
+        &self.inner
     }
 }
 

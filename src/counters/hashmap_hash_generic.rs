@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 // Generic HashMap-based counter that works with hash values (u64) directly
+#[derive(Clone)]
 pub struct GenericHashMapHashCounter<H: BuildHasher + Default> {
     counts: Arc<Mutex<HashMap<u64, u64, H>>>,
 }
@@ -29,5 +30,19 @@ impl<H: BuildHasher + Default + Send + Sync> HashCounterCore for GenericHashMapH
 
     fn total_count(&self) -> u64 {
         self.counts.lock().unwrap().values().sum()
+    }
+}
+
+impl<H: BuildHasher + Default + Send + Sync> GenericHashMapHashCounter<H> {
+    /// Returns the approximate heap memory used by the HashMap data structure in bytes.
+    /// This includes the memory for keys (u64 hashes), values (counts), and hash table overhead.
+    pub fn heap_size_bytes(&self) -> usize {
+        let counts = self.counts.lock().unwrap();
+        
+        // HashMap capacity-based memory: entries + internal overhead
+        let capacity = counts.capacity();
+        let entry_size = std::mem::size_of::<(u64, u64)>();
+        
+        capacity * entry_size
     }
 }
