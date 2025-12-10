@@ -184,6 +184,7 @@ fn process_chunk_gzip_hashes(
     filename: &str,
     k: usize,
     show_progress: bool,
+    use_nthash: bool,
 ) -> std::io::Result<HashMap<u64, u64>> {
     use needletail::parse_fastx_file;
     
@@ -198,7 +199,7 @@ fn process_chunk_gzip_hashes(
         let seqrec = record.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let seq = seqrec.seq();
         total_bases += seq.len() as u64;
-        count_hashes_in_sequence(&seq, k, &mut hash_counts);
+        count_hashes_in_sequence(&seq, k, &mut hash_counts, use_nthash);
         
         record_count += 1;
         if show_progress && record_count % 1000 == 0 {
@@ -254,6 +255,7 @@ fn process_chunk_hashes(
     filename: &str,
     chunk: Chunk,
     k: usize,
+    use_nthash: bool,
 ) -> std::io::Result<HashMap<u64, u64>> {
     let mut file = File::open(filename)?;
     file.seek(SeekFrom::Start(chunk.start))?;
@@ -277,7 +279,7 @@ fn process_chunk_hashes(
         if line.starts_with('>') || line.starts_with('@') {
             // Process previous sequence if any
             if !current_seq.is_empty() {
-                count_hashes_in_sequence(&current_seq, k, &mut hash_counts);
+                count_hashes_in_sequence(&current_seq, k, &mut hash_counts, use_nthash);
                 current_seq.clear();
             }
         } else if line.starts_with('+') {
@@ -294,7 +296,7 @@ fn process_chunk_hashes(
     
     // Process last sequence
     if !current_seq.is_empty() {
-        count_hashes_in_sequence(&current_seq, k, &mut hash_counts);
+        count_hashes_in_sequence(&current_seq, k, &mut hash_counts, use_nthash);
     }
     
     Ok(hash_counts)
@@ -307,6 +309,7 @@ fn run_with_hash_counter<C: HashCounter>(
     chunks: Vec<Chunk>,
     setup_time: std::time::Duration,
     counter: C,
+    use_nthash: bool,
 ) -> Result<(usize, u64, std::time::Duration, std::time::Duration, Option<u64>), Box<dyn std::error::Error>> {
     let k = args.kmer_size;
     let filename = &args.filename;
@@ -319,7 +322,7 @@ fn run_with_hash_counter<C: HashCounter>(
     
     if is_gzip {
         // For gzipped files, use needletail (single-threaded)
-        match process_chunk_gzip_hashes(&filename, k, !json_mode) {
+        match process_chunk_gzip_hashes(&filename, k, !json_mode, use_nthash) {
             Ok(local_counts) => {
                 counter.merge_hashes(local_counts);
             }
@@ -332,7 +335,7 @@ fn run_with_hash_counter<C: HashCounter>(
                 let thread_idx = rayon::current_thread_index().unwrap_or(0);
                 println!("  Thread {} processing chunk {}...", thread_idx, i);
             }
-            match process_chunk_hashes(&filename, Chunk { start: chunk.start, end: chunk.end }, k) {
+            match process_chunk_hashes(&filename, Chunk { start: chunk.start, end: chunk.end }, k, use_nthash) {
                 Ok(local_counts) => {
                     counter.merge_hashes(local_counts);
                 }
@@ -416,51 +419,9 @@ fn count_kmers_in_sequence(seq: &[u8], k: usize, kmer_counts: &mut HashMap<Vec<u
     }
 }
 
-// Direct k-mer processing for HyperLogLog using NtHash rolling hash (with batching)
+// Unified k-mer processing for HyperLogLog with optional NtHash rolling hash (with batching)
 // Collects hashes in a local buffer and flushes in batches to reduce lock contention
-fn process_kmers_streaming_nthash(seq: &[u8], k: usize, counter: &HyperLogLogCounter) {
-    if seq.len() < k {
-        return;
-    }
-
-    const BATCH_SIZE: usize = 10000; // Batch hashes before updating shared counter
-    let mut hash_buffer = Vec::with_capacity(BATCH_SIZE);
-
-    // Normalize sequence to uppercase and validate for standard DNA bases
-    let normalized: Vec<u8> = seq.iter().map(|&b| b.to_ascii_uppercase()).collect();
-    
-    // Check if sequence contains only standard DNA bases (A, C, G, T, N)
-    // NtHash panics on non-standard bases like Y, R, etc.
-    let is_valid_dna = normalized.iter().all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'N'));
-    
-    if !is_valid_dna {
-        // Skip sequences with non-standard nucleotides
-        return;
-    }
-    
-    // Use NtHash rolling hash for efficient DNA k-mer hashing
-    if let Ok(nthash_iter) = nthash::NtHashIterator::new(&normalized, k) {
-        for hash_value in nthash_iter {
-            hash_buffer.push(hash_value);
-            
-            // Flush batch when buffer is full
-            if hash_buffer.len() >= BATCH_SIZE {
-                counter.batch_add_hashes(&hash_buffer);
-                hash_buffer.clear();
-            }
-        }
-        
-        // Flush remaining hashes
-        if !hash_buffer.is_empty() {
-            counter.batch_add_hashes(&hash_buffer);
-        }
-    }
-    // Note: Non-DNA sequences or NtHash failures are silently skipped
-    // This is appropriate for DNA k-mer counting applications
-}
-
-// Generic k-mer processing for HyperLogLog using sliding window hashing
-fn process_kmers_streaming_generic(seq: &[u8], k: usize, counter: &HyperLogLogCounter) {
+fn process_kmers_streaming(seq: &[u8], k: usize, counter: &HyperLogLogCounter, use_nthash: bool) {
     use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
     
@@ -468,26 +429,60 @@ fn process_kmers_streaming_generic(seq: &[u8], k: usize, counter: &HyperLogLogCo
         return;
     }
 
-    const BATCH_SIZE: usize = 10000;
+    const BATCH_SIZE: usize = 10000; // Batch hashes before updating shared counter
     let mut hash_buffer = Vec::with_capacity(BATCH_SIZE);
 
-    // Slide through the sequence and hash each k-mer
-    for i in 0..=seq.len() - k {
-        let kmer = &seq[i..i + k];
-        let mut hasher = DefaultHasher::new();
-        kmer.hash(&mut hasher);
-        let hash_value = hasher.finish();
+    if use_nthash {
+        // NtHash path: Normalize sequence to uppercase and validate for standard DNA bases
+        let normalized: Vec<u8> = seq.iter().map(|&b| b.to_ascii_uppercase()).collect();
         
-        hash_buffer.push(hash_value);
+        // Check if sequence contains only standard DNA bases (A, C, G, T, N)
+        // NtHash panics on non-standard bases like Y, R, etc.
+        let is_valid_dna = normalized.iter().all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'N'));
         
-        if hash_buffer.len() >= BATCH_SIZE {
-            counter.batch_add_hashes(&hash_buffer);
-            hash_buffer.clear();
+        if !is_valid_dna {
+            // Skip sequences with non-standard nucleotides
+            return;
         }
-    }
-    
-    if !hash_buffer.is_empty() {
-        counter.batch_add_hashes(&hash_buffer);
+        
+        // Use NtHash rolling hash for efficient DNA k-mer hashing
+        if let Ok(nthash_iter) = nthash::NtHashIterator::new(&normalized, k) {
+            for hash_value in nthash_iter {
+                hash_buffer.push(hash_value);
+                
+                // Flush batch when buffer is full
+                if hash_buffer.len() >= BATCH_SIZE {
+                    counter.batch_add_hashes(&hash_buffer);
+                    hash_buffer.clear();
+                }
+            }
+            
+            // Flush remaining hashes
+            if !hash_buffer.is_empty() {
+                counter.batch_add_hashes(&hash_buffer);
+            }
+        }
+        // Note: Non-DNA sequences or NtHash failures are silently skipped
+        // This is appropriate for DNA k-mer counting applications
+    } else {
+        // Generic path: Slide through the sequence and hash each k-mer
+        for i in 0..=seq.len() - k {
+            let kmer = &seq[i..i + k];
+            let mut hasher = DefaultHasher::new();
+            kmer.hash(&mut hasher);
+            let hash_value = hasher.finish();
+            
+            hash_buffer.push(hash_value);
+            
+            if hash_buffer.len() >= BATCH_SIZE {
+                counter.batch_add_hashes(&hash_buffer);
+                hash_buffer.clear();
+            }
+        }
+        
+        if !hash_buffer.is_empty() {
+            counter.batch_add_hashes(&hash_buffer);
+        }
     }
 }
 
@@ -524,11 +519,7 @@ fn process_file_chunk_hll_streaming(
         if line.starts_with('>') || line.starts_with('@') {
             // Process previous sequence if any
             if !current_seq.is_empty() {
-                if use_nthash {
-                    process_kmers_streaming_nthash(&current_seq, k, counter);
-                } else {
-                    process_kmers_streaming_generic(&current_seq, k, counter);
-                }
+                process_kmers_streaming(&current_seq, k, counter, use_nthash);
                 current_seq.clear();
             }
         } else if line.starts_with('+') {
@@ -545,11 +536,7 @@ fn process_file_chunk_hll_streaming(
             // This limits memory usage while maintaining k-mer continuity across windows
             if current_seq.len() >= MAX_SEQ_WINDOW {
                 // Process what we have so far
-                if use_nthash {
-                    process_kmers_streaming_nthash(&current_seq, k, counter);
-                } else {
-                    process_kmers_streaming_generic(&current_seq, k, counter);
-                }
+                process_kmers_streaming(&current_seq, k, counter, use_nthash);
                 
                 // Keep last k-1 bases for continuity (to handle k-mers spanning the window boundary)
                 if current_seq.len() >= k {
@@ -563,11 +550,7 @@ fn process_file_chunk_hll_streaming(
     
     // Process last sequence
     if !current_seq.is_empty() {
-        if use_nthash {
-            process_kmers_streaming_nthash(&current_seq, k, counter);
-        } else {
-            process_kmers_streaming_generic(&current_seq, k, counter);
-        }
+        process_kmers_streaming(&current_seq, k, counter, use_nthash);
     }
     
     Ok(())
@@ -597,11 +580,7 @@ fn process_chunk_gzip_hll_streaming(
         let seqrec = record.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let seq = seqrec.seq();
         total_bases += seq.len() as u64;
-        if use_nthash {
-            process_kmers_streaming_nthash(&seq, k, counter);
-        } else {
-            process_kmers_streaming_generic(&seq, k, counter);
-        }
+        process_kmers_streaming(&seq, k, counter, use_nthash);
         
         record_count += 1;
         if show_progress && record_count % 1000 == 0 {
@@ -616,38 +595,42 @@ fn process_chunk_gzip_hll_streaming(
     Ok(())
 }
 
-fn count_hashes_in_sequence(seq: &[u8], k: usize, hash_counts: &mut HashMap<u64, u64>) {
+fn count_hashes_in_sequence(seq: &[u8], k: usize, hash_counts: &mut HashMap<u64, u64>, use_nthash: bool) {
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    
     if seq.len() < k {
         return;
     }
 
-    // Check if sequence is valid DNA (only A,C,G,T,N after uppercase conversion)
-    let is_valid_dna = seq.iter().all(|&b| {
-        let upper_b = b.to_ascii_uppercase();
-        matches!(upper_b, b'A' | b'C' | b'G' | b'T' | b'N')
-    });
+    if use_nthash {
+        // NtHash path: Check if sequence is valid DNA (only A,C,G,T,N after uppercase conversion)
+        let is_valid_dna = seq.iter().all(|&b| {
+            let upper_b = b.to_ascii_uppercase();
+            matches!(upper_b, b'A' | b'C' | b'G' | b'T' | b'N')
+        });
 
-    if is_valid_dna {
-        // Normalize sequence to uppercase
-        let normalized: Vec<u8> = seq
-            .iter()
-            .map(|&b| b.to_ascii_uppercase())
-            .collect();
-        
-        // Try NtHash rolling hash for valid DNA sequences
-        if let Ok(nthash_iter) = nthash::NtHashIterator::new(&normalized, k) {
-            // Use rolling hash - much faster for DNA
-            for hash_value in nthash_iter {
-                *hash_counts.entry(hash_value).or_insert(0) += 1;
+        if is_valid_dna {
+            // Normalize sequence to uppercase
+            let normalized: Vec<u8> = seq
+                .iter()
+                .map(|&b| b.to_ascii_uppercase())
+                .collect();
+            
+            // Try NtHash rolling hash for valid DNA sequences
+            if let Ok(nthash_iter) = nthash::NtHashIterator::new(&normalized, k) {
+                // Use rolling hash - much faster for DNA
+                for hash_value in nthash_iter {
+                    *hash_counts.entry(hash_value).or_insert(0) += 1;
+                }
+                return;
             }
-            return;
         }
+        // If NtHash fails or invalid DNA, skip this sequence
+        return;
     }
     
-    // Fallback to sliding window with FNV hash for non-DNA or NtHash failures
-    use std::hash::{Hash, Hasher};
-    use std::collections::hash_map::DefaultHasher;
-    
+    // Generic path: sliding window with DefaultHasher for all sequences
     for i in 0..=seq.len() - k {
         let mut hasher = DefaultHasher::new();
         seq[i..i + k].hash(&mut hasher);
@@ -957,7 +940,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (CounterType::HashMap, HashType::NtHash) => {
             let counter = MemoryTrackedHashCounter::<GenericHashMapHashCounter<DefaultHasher>>::new();
             let counter_clone = counter.clone();
-            let (unique, total, ctime, ttime, pmem) = run_with_hash_counter(&args, num_threads, chunks.clone(), setup_time, counter)?;
+            let (unique, total, ctime, ttime, pmem) = run_with_hash_counter(&args, num_threads, chunks.clone(), setup_time, counter, true)?;
             let heap_size = counter_clone.inner().heap_size_bytes();
             if !args.json {
                 eprintln!("HashMap counter heap size: {} bytes ({:.2} MB)", 
@@ -979,7 +962,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (CounterType::DashMap, HashType::NtHash) => {
             let counter = MemoryTrackedHashCounter::<GenericHashMapHashCounter<DefaultHasher>>::new();
             let counter_clone = counter.clone();
-            let (unique, total, ctime, ttime, pmem) = run_with_hash_counter(&args, num_threads, chunks.clone(), setup_time, counter)?;
+            let (unique, total, ctime, ttime, pmem) = run_with_hash_counter(&args, num_threads, chunks.clone(), setup_time, counter, true)?;
             let heap_size = counter_clone.inner().heap_size_bytes();
             if !args.json {
                 eprintln!("HashMap counter heap size: {} bytes ({:.2} MB)", 

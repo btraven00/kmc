@@ -1,4 +1,4 @@
-use super::KmerCounterCore;
+use super::CounterCore;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ pub struct GenericHashMapCounter<H: BuildHasher + Default> {
     counts: Arc<Mutex<HashMap<Vec<u8>, u64, H>>>,
 }
 
-impl<H: BuildHasher + Default + Send + Sync> KmerCounterCore for GenericHashMapCounter<H> {
+impl<H: BuildHasher + Default + Send + Sync> CounterCore for GenericHashMapCounter<H> {
     fn new() -> Self {
         GenericHashMapCounter {
             counts: Arc::new(Mutex::new(HashMap::with_hasher(H::default()))),

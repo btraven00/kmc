@@ -33,40 +33,43 @@ pub fn get_memory_usage_bytes() -> Option<u64> {
     }
 }
 
-// Core trait for k-mer counting strategies (without memory tracking)
-pub trait KmerCounterCore: Send + Sync {
+// Core trait for counter implementations (without memory tracking)
+// Counters can support k-mer-based counting, hash-based counting, or both
+pub trait CounterCore: Send + Sync {
     fn new() -> Self where Self: Sized;
-    fn merge(&self, local_counts: HashMap<Vec<u8>, u64>);
+    
+    // K-mer-based interface (optional)
+    fn merge(&self, _local_counts: HashMap<Vec<u8>, u64>) {
+        panic!("K-mer merge not supported by this counter");
+    }
+    
+    // Hash-based interface (optional)
+    fn merge_hashes(&self, _local_counts: HashMap<u64, u64>) {
+        panic!("Hash merge not supported by this counter");
+    }
+    
     fn unique_count(&self) -> usize;
     fn total_count(&self) -> u64;
 }
 
-// Hash-based counter trait for streaming approach
-pub trait HashCounterCore: Send + Sync {
-    fn new() -> Self where Self: Sized;
-    fn merge_hashes(&self, local_counts: HashMap<u64, u64>);
-    fn unique_count(&self) -> usize;
-    fn total_count(&self) -> u64;
-}
-
-// Wrapper that adds memory tracking to any counter implementation
+// Unified wrapper that adds memory tracking to any counter implementation
 #[derive(Clone)]
-pub struct MemoryTrackedCounter<C: KmerCounterCore> {
+pub struct MemoryTrackedCounter<C: CounterCore> {
     inner: C,
     peak_memory: Arc<AtomicU64>,
 }
 
-impl<C: KmerCounterCore> MemoryTrackedCounter<C> {
+impl<C: CounterCore> MemoryTrackedCounter<C> {
     pub fn new() -> Self {
         let counter = MemoryTrackedCounter {
             inner: C::new(),
             peak_memory: Arc::new(AtomicU64::new(0)),
         };
-        counter.do_update_peak_memory();
+        counter.update_peak_memory();
         counter
     }
 
-    fn do_update_peak_memory(&self) {
+    fn update_peak_memory(&self) {
         if let Some(current_mem) = get_memory_usage_bytes() {
             let mut peak = self.peak_memory.load(Ordering::Relaxed);
             while current_mem > peak {
@@ -87,100 +90,38 @@ impl<C: KmerCounterCore> MemoryTrackedCounter<C> {
     pub fn inner(&self) -> &C {
         &self.inner
     }
-}
-
-// Hash-based memory tracked counter
-#[derive(Clone)]
-pub struct MemoryTrackedHashCounter<C: HashCounterCore> {
-    inner: C,
-    peak_memory: Arc<AtomicU64>,
-}
-
-impl<C: HashCounterCore> MemoryTrackedHashCounter<C> {
-    pub fn new() -> Self {
-        let counter = MemoryTrackedHashCounter {
-            inner: C::new(),
-            peak_memory: Arc::new(AtomicU64::new(0)),
-        };
-        counter.do_update_peak_memory();
-        counter
-    }
-
-    fn do_update_peak_memory(&self) {
-        if let Some(current_mem) = get_memory_usage_bytes() {
-            let mut peak = self.peak_memory.load(Ordering::Relaxed);
-            while current_mem > peak {
-                match self.peak_memory.compare_exchange_weak(
-                    peak,
-                    current_mem,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(x) => peak = x,
-                }
-            }
-        }
-    }
     
-    /// Get reference to the inner counter for accessing type-specific methods
-    pub fn inner(&self) -> &C {
-        &self.inner
+    pub fn peak_memory_bytes(&self) -> Option<u64> {
+        let peak = self.peak_memory.load(Ordering::Relaxed);
+        if peak > 0 { Some(peak) } else { None }
     }
 }
 
-// Public trait that includes memory tracking
-pub trait KmerCounter: Send + Sync {
+// Unified public trait for all counters with memory tracking
+pub trait Counter: Send + Sync {
+    // K-mer-based counting
     fn merge(&self, local_counts: HashMap<Vec<u8>, u64>);
-    fn unique_count(&self) -> usize;
-    fn total_count(&self) -> u64;
-    fn update_peak_memory(&self);
-    fn peak_memory_bytes(&self) -> Option<u64>;
-}
-
-// Hash-based counter trait with memory tracking
-pub trait HashCounter: Send + Sync {
+    
+    // Hash-based counting  
     fn merge_hashes(&self, local_counts: HashMap<u64, u64>);
+    
+    // Common interface
     fn unique_count(&self) -> usize;
     fn total_count(&self) -> u64;
     fn update_peak_memory(&self);
     fn peak_memory_bytes(&self) -> Option<u64>;
 }
 
-// Implement KmerCounter for the wrapper
-impl<C: KmerCounterCore> KmerCounter for MemoryTrackedCounter<C> {
+// Implement unified Counter trait for the wrapper
+impl<C: CounterCore> Counter for MemoryTrackedCounter<C> {
     fn merge(&self, local_counts: HashMap<Vec<u8>, u64>) {
         self.inner.merge(local_counts);
-        self.do_update_peak_memory();
+        self.update_peak_memory();
     }
 
-    fn unique_count(&self) -> usize {
-        self.inner.unique_count()
-    }
-
-    fn total_count(&self) -> u64 {
-        self.inner.total_count()
-    }
-
-    fn update_peak_memory(&self) {
-        self.do_update_peak_memory();
-    }
-
-    fn peak_memory_bytes(&self) -> Option<u64> {
-        let peak = self.peak_memory.load(Ordering::Relaxed);
-        if peak > 0 {
-            Some(peak)
-        } else {
-            None
-        }
-    }
-}
-
-// Implement HashCounter for the hash-based wrapper
-impl<C: HashCounterCore> HashCounter for MemoryTrackedHashCounter<C> {
     fn merge_hashes(&self, local_counts: HashMap<u64, u64>) {
         self.inner.merge_hashes(local_counts);
-        self.do_update_peak_memory();
+        self.update_peak_memory();
     }
 
     fn unique_count(&self) -> usize {
@@ -192,15 +133,19 @@ impl<C: HashCounterCore> HashCounter for MemoryTrackedHashCounter<C> {
     }
 
     fn update_peak_memory(&self) {
-        self.do_update_peak_memory();
+        self.update_peak_memory();
     }
 
     fn peak_memory_bytes(&self) -> Option<u64> {
-        let peak = self.peak_memory.load(Ordering::Relaxed);
-        if peak > 0 {
-            Some(peak)
-        } else {
-            None
-        }
+        self.peak_memory_bytes()
     }
 }
+
+// Deprecated aliases for backward compatibility
+pub trait KmerCounter: Counter {}
+impl<T: Counter> KmerCounter for T {}
+
+pub trait HashCounter: Counter {}
+impl<T: Counter> HashCounter for T {}
+
+pub type MemoryTrackedHashCounter<C> = MemoryTrackedCounter<C>;

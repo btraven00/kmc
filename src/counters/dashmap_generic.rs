@@ -1,4 +1,4 @@
-use super::KmerCounterCore;
+use super::CounterCore;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
@@ -10,7 +10,7 @@ pub struct GenericDashMapCounter<H: BuildHasher + Clone> {
     counts: Arc<DashMap<Vec<u8>, u64, H>>,
 }
 
-impl<H: BuildHasher + Clone + Default + Send + Sync> KmerCounterCore for GenericDashMapCounter<H> {
+impl<H: BuildHasher + Clone + Default + Send + Sync> CounterCore for GenericDashMapCounter<H> {
     fn new() -> Self {
         GenericDashMapCounter {
             counts: Arc::new(DashMap::with_hasher(H::default())),
