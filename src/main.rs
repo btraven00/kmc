@@ -433,37 +433,46 @@ fn process_kmers_streaming(seq: &[u8], k: usize, counter: &HyperLogLogCounter, u
     let mut hash_buffer = Vec::with_capacity(BATCH_SIZE);
 
     if use_nthash {
-        // NtHash path: Normalize sequence to uppercase and validate for standard DNA bases
+        // NtHash path: Normalize sequence to uppercase
         let normalized: Vec<u8> = seq.iter().map(|&b| b.to_ascii_uppercase()).collect();
         
-        // Check if sequence contains only standard DNA bases (A, C, G, T, N)
-        // NtHash panics on non-standard bases like Y, R, etc.
-        let is_valid_dna = normalized.iter().all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'N'));
+        // Check for non-standard bases (not A, C, G, T, N)
+        // NtHash panics on bases like Y, R, etc.
+        let has_invalid = normalized.iter().any(|&b| !matches!(b, b'A' | b'C' | b'G' | b'T' | b'N'));
         
-        if !is_valid_dna {
+        if has_invalid {
             // Skip sequences with non-standard nucleotides
             return;
         }
         
-        // Use NtHash rolling hash for efficient DNA k-mer hashing
-        if let Ok(nthash_iter) = nthash::NtHashIterator::new(&normalized, k) {
-            for hash_value in nthash_iter {
-                hash_buffer.push(hash_value);
-                
-                // Flush batch when buffer is full
-                if hash_buffer.len() >= BATCH_SIZE {
-                    counter.batch_add_hashes(&hash_buffer);
-                    hash_buffer.clear();
-                }
+        // Process k-mers, skipping those that contain 'N'
+        // This matches KMC3/ntCard behavior
+        for i in 0..=normalized.len().saturating_sub(k) {
+            let kmer_window = &normalized[i..i + k];
+            
+            // Skip k-mers containing 'N'
+            if kmer_window.contains(&b'N') {
+                continue;
             }
             
-            // Flush remaining hashes
-            if !hash_buffer.is_empty() {
-                counter.batch_add_hashes(&hash_buffer);
+            // Use NtHash for this k-mer
+            if let Ok(mut nthash_iter) = nthash::NtHashIterator::new(kmer_window, k) {
+                if let Some(hash_value) = nthash_iter.next() {
+                    hash_buffer.push(hash_value);
+                    
+                    // Flush batch when buffer is full
+                    if hash_buffer.len() >= BATCH_SIZE {
+                        counter.batch_add_hashes(&hash_buffer);
+                        hash_buffer.clear();
+                    }
+                }
             }
         }
-        // Note: Non-DNA sequences or NtHash failures are silently skipped
-        // This is appropriate for DNA k-mer counting applications
+        
+        // Flush remaining hashes
+        if !hash_buffer.is_empty() {
+            counter.batch_add_hashes(&hash_buffer);
+        }
     } else {
         // Generic path: Slide through the sequence and hash each k-mer
         for i in 0..=seq.len() - k {
@@ -604,29 +613,34 @@ fn count_hashes_in_sequence(seq: &[u8], k: usize, hash_counts: &mut HashMap<u64,
     }
 
     if use_nthash {
-        // NtHash path: Check if sequence is valid DNA (only A,C,G,T,N after uppercase conversion)
-        let is_valid_dna = seq.iter().all(|&b| {
-            let upper_b = b.to_ascii_uppercase();
-            matches!(upper_b, b'A' | b'C' | b'G' | b'T' | b'N')
-        });
-
-        if is_valid_dna {
-            // Normalize sequence to uppercase
-            let normalized: Vec<u8> = seq
-                .iter()
-                .map(|&b| b.to_ascii_uppercase())
-                .collect();
+        // NtHash path: Normalize sequence to uppercase
+        let normalized: Vec<u8> = seq.iter().map(|&b| b.to_ascii_uppercase()).collect();
+        
+        // Check for non-standard bases (not A, C, G, T, N)
+        let has_invalid = normalized.iter().any(|&b| !matches!(b, b'A' | b'C' | b'G' | b'T' | b'N'));
+        
+        if has_invalid {
+            // Skip sequences with non-standard nucleotides
+            return;
+        }
+        
+        // Process k-mers, skipping those that contain 'N'
+        // This matches KMC3/ntCard behavior
+        for i in 0..=normalized.len().saturating_sub(k) {
+            let kmer_window = &normalized[i..i + k];
             
-            // Try NtHash rolling hash for valid DNA sequences
-            if let Ok(nthash_iter) = nthash::NtHashIterator::new(&normalized, k) {
-                // Use rolling hash - much faster for DNA
-                for hash_value in nthash_iter {
+            // Skip k-mers containing 'N'
+            if kmer_window.contains(&b'N') {
+                continue;
+            }
+            
+            // Use NtHash for this k-mer
+            if let Ok(mut nthash_iter) = nthash::NtHashIterator::new(kmer_window, k) {
+                if let Some(hash_value) = nthash_iter.next() {
                     *hash_counts.entry(hash_value).or_insert(0) += 1;
                 }
-                return;
             }
         }
-        // If NtHash fails or invalid DNA, skip this sequence
         return;
     }
     

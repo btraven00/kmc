@@ -1,0 +1,12 @@
+# why k=31?
+
+it's in the goldilocks zone:
+
+- it fits 64 bit w/o overflow (62 bits)
+- odd: avoids reverse complement match
+- good trade-off between sensitivity and specificity for multicellular organisms.
+
+
+# discrepancies
+
+small discrepancies with total kmer count in ntCard: I was missing to skip k-mers including N (ntcard and kmc3 do).

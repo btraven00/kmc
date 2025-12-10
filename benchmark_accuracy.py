@@ -18,6 +18,7 @@ import subprocess
 import json
 import time
 import sys
+import argparse
 from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -54,8 +55,9 @@ def run_ntcard():
     )
     elapsed = time.time() - start_time
     
-    # Parse output (tab-separated: k=31\tF0\t123456789)
-    lines = result.stdout.strip().split('\n')
+    # Parse output from stderr (ntCard outputs to stderr, not stdout)
+    # Format: k=31\tF0\t123456789
+    lines = result.stderr.strip().split('\n')
     f0 = f1 = None
     for line in lines:
         parts = line.split('\t')
@@ -66,7 +68,7 @@ def run_ntcard():
                 f1 = int(parts[2])
     
     if f0 is None or f1 is None:
-        raise ValueError(f"Failed to parse ntCard output. Got F0={f0}, F1={f1}")
+        raise ValueError(f"Failed to parse ntCard output. Got F0={f0}, F1={f1}\nOutput: {result.stderr}")
     
     return {
         "unique_kmers": f0,
@@ -85,11 +87,11 @@ def main():
     
     results = []
     
-    # 1. Exact counting
-    print("[1/4] Running exact counting (HashMap + NtHash) - this may take a while...")
-    exact_data = run_kmc("hashmap", "nt")
+    # 0. Exact counting with DashMap + NtHash (ground truth)
+    print("[0/3] Running exact counting (DashMap + NtHash) for ground truth...")
+    exact_data = run_kmc("dashmap", "nt")
     exact_result = {
-        "method": "exact",
+        "method": "exact_dashmap",
         "unique_kmers": exact_data["results"]["unique_kmers"],
         "total_kmers": exact_data["results"]["total_kmers"],
         "complexity": exact_data["results"]["complexity"],
@@ -98,25 +100,20 @@ def main():
     }
     results.append(exact_result)
     print(f"  Exact unique k-mers: {exact_result['unique_kmers']:,}")
+    print(f"  Exact total k-mers: {exact_result['total_kmers']:,}")
     print()
     
-    # 2. HLL + FxHash
-    print("[2/4] Running HyperLogLog + FxHash...")
-    fx_data = run_kmc("hll", "fx")
-    fx_result = {
-        "method": "hll_fxhash",
-        "unique_kmers": fx_data["results"]["unique_kmers"],
-        "total_kmers": fx_data["results"]["total_kmers"],
-        "complexity": fx_data["results"]["complexity"],
-        "time_seconds": fx_data["results"]["total_time_ms"] / 1000,
-        "memory_mb": fx_data["results"].get("peak_memory_bytes", 0) / 1048576
-    }
-    results.append(fx_result)
-    print(f"  FxHash unique k-mers: {fx_result['unique_kmers']:,}")
+    # 1. ntCard
+    print("[1/3] Running ntCard...")
+    ntcard_result = run_ntcard()
+    ntcard_result["method"] = "ntcard"
+    results.append(ntcard_result)
+    print(f"  ntCard unique k-mers: {ntcard_result['unique_kmers']:,}")
+    print(f"  ntCard total k-mers: {ntcard_result['total_kmers']:,}")
     print()
     
-    # 3. HLL + NtHash
-    print("[3/4] Running HyperLogLog + NtHash...")
+    # 2. HLL + NtHash
+    print("[2/3] Running HyperLogLog + NtHash...")
     nt_data = run_kmc("hll", "nt")
     nt_result = {
         "method": "hll_nthash",
@@ -127,26 +124,38 @@ def main():
         "memory_mb": nt_data["results"].get("peak_memory_bytes", 0) / 1048576
     }
     results.append(nt_result)
-    print(f"  NtHash unique k-mers: {nt_result['unique_kmers']:,}")
+    print(f"  HLL+NtHash unique k-mers: {nt_result['unique_kmers']:,}")
+    print(f"  HLL+NtHash total k-mers: {nt_result['total_kmers']:,}")
     print()
     
-    # 4. ntCard
-    print("[4/4] Running ntCard...")
-    ntcard_result = run_ntcard()
-    ntcard_result["method"] = "ntcard"
-    results.append(ntcard_result)
-    print(f"  ntCard unique k-mers: {ntcard_result['unique_kmers']:,}")
+    # 3. HLL + FxHash  
+    print("[3/3] Running HyperLogLog + FxHash...")
+    fx_data = run_kmc("hll", "fx")
+    fx_result = {
+        "method": "hll_fxhash",
+        "unique_kmers": fx_data["results"]["unique_kmers"],
+        "total_kmers": fx_data["results"]["total_kmers"],
+        "complexity": fx_data["results"]["complexity"],
+        "time_seconds": fx_data["results"]["total_time_ms"] / 1000,
+        "memory_mb": fx_data["results"].get("peak_memory_bytes", 0) / 1048576
+    }
+    results.append(fx_result)
+    print(f"  HLL+FxHash unique k-mers: {fx_result['unique_kmers']:,}")
+    print(f"  HLL+FxHash total k-mers: {fx_result['total_kmers']:,}")
     print()
     
     # Save to CSV
     df = pd.DataFrame(results)
     df.to_csv(OUTPUT_CSV, index=False)
     
-    # Calculate errors and speedups
-    exact_count = exact_result["unique_kmers"]
-    exact_time = exact_result["time_seconds"]
+    # Calculate errors and speedups using DashMap as ground truth
+    ground_truth = results[0]
+    exact_unique = ground_truth["unique_kmers"]
+    exact_total = ground_truth["total_kmers"]
+    exact_time = ground_truth["time_seconds"]
     
-    df['error_pct'] = ((df['unique_kmers'] - exact_count) / exact_count) * 100
+    df['error_unique_pct'] = ((df['unique_kmers'] - exact_unique) / exact_unique) * 100
+    df['error_total_pct'] = ((df['total_kmers'] - exact_total) / exact_total) * 100
     df['speedup'] = exact_time / df['time_seconds']
     
     # Print summary
@@ -155,22 +164,24 @@ def main():
     print(df.to_string(index=False))
     print()
     
-    print("=== Accuracy Analysis (vs Exact) ===")
+    print("=== Accuracy Analysis (vs Exact DashMap) ===")
     print()
-    print(f"{'Method':<16} | {'Unique K-mers':>13} | {'Error %':>10} | {'Time (s)':>8} | {'Speedup':>7}")
-    print("-" * 75)
+    print(f"{'Method':<16} | {'Unique K-mers':>13} | {'Total K-mers':>13} | {'Unique Err %':>12} | {'Total Err %':>11} | {'Time (s)':>8} | {'Speedup':>7}")
+    print("-" * 115)
     
-    for _, row in df.iterrows():
+    for idx, row in df.iterrows():
         method = row['method']
         unique = int(row['unique_kmers'])
-        error = row['error_pct']
+        total = int(row['total_kmers'])
+        err_unique = row['error_unique_pct']
+        err_total = row['error_total_pct']
         time_s = row['time_seconds']
         speedup = row['speedup']
         
-        if method == 'exact':
-            print(f"{method:<16} | {unique:>13,} | {'0.00%':>10} | {time_s:>8.2f} | {'1.0x':>7}")
+        if idx == 0:  # First row is ground truth
+            print(f"{method:<16} | {unique:>13,} | {total:>13,} | {'0.00%':>12} | {'0.00%':>11} | {time_s:>8.2f} | {'1.0x':>7}")
         else:
-            print(f"{method:<16} | {unique:>13,} | {error:>9.2f}% | {time_s:>8.2f} | {speedup:>6.1f}x")
+            print(f"{method:<16} | {unique:>13,} | {total:>13,} | {err_unique:>11.2f}% | {err_total:>10.2f}% | {time_s:>8.2f} | {speedup:>6.1f}x")
     
     print()
     print(f"Results saved to: {OUTPUT_CSV}")
@@ -178,7 +189,7 @@ def main():
     # Visualization
     print()
     print("Generating visualization...")
-    create_visualization(df, exact_count)
+    create_visualization(df, exact_unique)
 
 def create_visualization(df, exact_count):
     """Create visualization plots"""
@@ -200,9 +211,9 @@ def create_visualization(df, exact_count):
         ax1.text(i, v + 0.02*max(df['unique_kmers']), f'{int(v):,}', 
                 ha='center', va='bottom', fontsize=9)
     
-    # 2. Error percentage
-    df_no_exact = df[df['method'] != 'exact']
-    errors = df_no_exact['error_pct'].values
+    # 2. Error percentage (unique k-mers)
+    df_no_exact = df[df['method'] != 'exact_dashmap']
+    errors = df_no_exact['error_unique_pct'].values
     error_methods = df_no_exact['method'].values
     error_colors = [colors[i+1] for i in range(len(error_methods))]
     
@@ -228,7 +239,7 @@ def create_visualization(df, exact_count):
     
     # 4. Speedup vs Accuracy tradeoff
     speedups = df_no_exact['speedup'].values
-    abs_errors = np.abs(df_no_exact['error_pct'].values)
+    abs_errors = np.abs(df_no_exact['error_unique_pct'].values)
     
     for i, method in enumerate(error_methods):
         ax4.scatter(abs_errors[i], speedups[i], s=300, color=error_colors[i], 
@@ -269,4 +280,29 @@ def create_visualization(df, exact_count):
     print(f"  - Runtime: {df[df['method'] == best_method]['time_seconds'].values[0]:.2f}s")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="K-mer counting accuracy benchmark")
+    parser.add_argument("--plot", action="store_true", help="Only generate visualization from existing CSV")
+    args = parser.parse_args()
+    
+    if args.plot:
+        # Just visualize from existing CSV
+        if not Path(OUTPUT_CSV).exists():
+            print(f"Error: {OUTPUT_CSV} not found. Run without --plot first to generate data.")
+            sys.exit(1)
+        
+        df = pd.read_csv(OUTPUT_CSV)
+        
+        # Calculate errors
+        exact_unique = df.iloc[0]['unique_kmers']
+        exact_total = df.iloc[0]['total_kmers']
+        exact_time = df.iloc[0]['time_seconds']
+        
+        df['error_unique_pct'] = ((df['unique_kmers'] - exact_unique) / exact_unique) * 100
+        df['error_total_pct'] = ((df['total_kmers'] - exact_total) / exact_total) * 100
+        df['speedup'] = exact_time / df['time_seconds']
+        
+        print("Generating visualization from existing data...")
+        create_visualization(df, exact_unique)
+    else:
+        # Run full benchmark
+        main()
