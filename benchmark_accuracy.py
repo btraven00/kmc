@@ -54,14 +54,19 @@ def run_ntcard():
     )
     elapsed = time.time() - start_time
     
-    # Parse output
+    # Parse output (tab-separated: k=31\tF0\t123456789)
     lines = result.stdout.strip().split('\n')
     f0 = f1 = None
     for line in lines:
-        if line.startswith(f"k={K}") and "F0" in line:
-            f0 = int(line.split()[2])
-        if line.startswith(f"k={K}") and "F1" in line:
-            f1 = int(line.split()[2])
+        parts = line.split('\t')
+        if len(parts) >= 3 and parts[0] == f"k={K}":
+            if parts[1] == "F0":
+                f0 = int(parts[2])
+            elif parts[1] == "F1":
+                f1 = int(parts[2])
+    
+    if f0 is None or f1 is None:
+        raise ValueError(f"Failed to parse ntCard output. Got F0={f0}, F1={f1}")
     
     return {
         "unique_kmers": f0,

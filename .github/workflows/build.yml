@@ -16,7 +16,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
         include:
           - os: ubuntu-latest
             artifact_name: kmc-linux
@@ -24,9 +24,6 @@ jobs:
           - os: macos-latest
             artifact_name: kmc-macos
             binary_path: target/release/kmc
-          - os: windows-latest
-            artifact_name: kmc-windows
-            binary_path: target/release/kmc.exe
 
     steps:
     - name: Checkout code
